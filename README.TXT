@@ -4,7 +4,7 @@
 
 DOOM where git is the display and the save system: every frame is a git commit and
 saves are git tags. Built on doomgeneric (below). See README.md or
-https://chicoxyzzy.github.io/git-doom/ for what it is and how to run it.
+https://sergey.works/git-doom/ for what it is and how to run it.
 
 The doomgeneric note and the original id Software DOOM source release follow,
 preserved unchanged.

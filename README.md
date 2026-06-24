@@ -111,7 +111,7 @@ build unchanged.)
 
 Short version below; the full write-up — rendering, the commit pipeline, terminal
 input, and the save system — is at
-**[chicoxyzzy.github.io/git-doom](https://chicoxyzzy.github.io/git-doom/)**.
+**[sergey.works/git-doom](https://sergey.works/git-doom/)**.
 
 `DG_DrawFrame` downsamples the 640×400 framebuffer to the grid and emits a truecolor
 block per cell (color escapes delta-encoded; each row positioned absolutely so it
