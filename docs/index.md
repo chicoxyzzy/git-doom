@@ -50,7 +50,7 @@ Then we paint with colored blocks:
   the bottom as background. Twice the vertical resolution, if your terminal tiles
   half-blocks cleanly (iTerm2, kitty, WezTerm do).
 
-Three details keep it honest and fast:
+Three details keep it correct and cheap:
 
 **Aspect.** A terminal cell is about twice as tall as it is wide. Make the grid
 `cols ≈ 3.2 × rows` and it displays at ~1.6:1 — exactly DOOM's 320×200. That's why the
@@ -98,10 +98,6 @@ is a tiny HUD (`frame 312 | hp 87 | 12s`); the body is the frame. Point `HEAD` a
 Every session starts a fresh orphan `main` — last run's recording is gone — and because
 all those commits share one empty tree, the repo grows only by commit objects. No
 blobs. A whole playthrough is cheap.
-
-Forking `git` twice per frame like that is the simple version — and too slow at large
-grids. So the default doesn't: it streams these same commits through one long-lived
-`git fast-import` instead. That's the next section.
 
 ### Keeping up with the game
 
@@ -201,11 +197,10 @@ else fetches, loads, and is standing exactly where you were, health and all.
 
 git is a content-addressed store of immutable objects with friendly names bolted on
 top. That is also — if you squint — a framebuffer and a save system, which is the whole
-joke, and it holds up. The bill comes due in throughput: every frame is an object write,
-and truecolor frames are big. Streaming them through `git fast-import` keeps that cheap
-enough to stay above DOOM's 35 Hz — but at the limit, recording still throttles play.
-Completeness over framerate, with `GITDOOM_BLOCK` and `GITDOOM_COMMIT` to trade one for
-the other.
+joke, and it holds up. The cost is throughput: every frame is an object write, and
+truecolor frames are big, so at large grids recording can still throttle play — even
+streamed through fast-import. Completeness over framerate, with `GITDOOM_BLOCK` and
+`GITDOOM_COMMIT` to trade one for the other.
 
 ## Map of the code
 
