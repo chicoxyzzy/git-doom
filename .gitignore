@@ -9,5 +9,12 @@
 Debug/
 Release/
 Build/
-doomgeneric
-doomgeneric.map
+/doomgeneric/doomgeneric
+/doomgeneric/doomgeneric.map
+
+# git-doom
+doomgeneric/build-git/
+doomgeneric/git-doom-play
+game-data/
+.savegame/
+*.wad

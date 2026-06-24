@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# git-doom — play DOOM as a truecolor terminal movie whose frames live in git commits.
+#
+#   producer:  ./git-doom play     # render + append every frame as a commit
+#   consumer:  ./git-doom watch     # follow HEAD, render the newest frame
+#              ./git-doom replay     # walk the main branch from the start
+#
+# Frames are commits on the `main` branch of a data repo; saves are git tags
+# carrying the real engine state. Producer and consumer share only that repo.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="$ROOT/doomgeneric/git-doom-play"
+WAD="${GITDOOM_WAD:-$ROOT/doom1.wad}"
+REPO="${GITDOOM_REPO:-$ROOT/game-data}"
+BRANCH="${GITDOOM_BRANCH:-main}"
+export GITDOOM_REPO GITDOOM_BRANCH
+
+show() { git --no-pager -C "$REPO" show -s --format='%B' "$1"; }   # --no-pager: don't open less per frame
+
+usage() {
+  cat <<EOF
+git-doom — DOOM frames stored in git commits
+
+  ./git-doom build              compile the engine (doomgeneric + git render layer)
+  ./git-doom play [WxH] [doom-args]
+                                play; render locally and commit every frame. An
+                                optional WxH (e.g. 120x40) pins an exact fixed size;
+                                otherwise it auto-fits the terminal.
+                                (try: ./git-doom play -warp 1 1   to skip to E1M1)
+                                charset: GITDOOM_CHARSET=color (default, solid
+                                truecolor blocks — no gaps) | half (2x vertical
+                                res, needs a terminal that tiles ▀ cleanly)
+  ./git-doom watch              follow the main branch, render the newest frame
+  ./git-doom replay [fps]       replay the whole main branch (default 15 fps)
+  ./git-doom saves              list save tags
+  ./git-doom thumb <name>       print a save's thumbnail
+  ./git-doom clean              remove the data repo and scratch savegame dir
+  ./git-doom gc                 pack/prune the data repo
+
+In-game keys: arrows or w/a/s/d move+turn · , . (or q/e) strafe · space fire
+              f use/open · 1-7 weapon · tab map · esc menu (Save/Load Game)
+              · ctrl-c quit. (Terminals can't send Ctrl/Shift/Alt, so fire=space.)
+EOF
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  build)
+    make -C "$ROOT/doomgeneric" -f Makefile.git "$@"
+    ;;
+
+  play)
+    [ -x "$BIN" ] || { echo "engine not built — run: ./git-doom build" >&2; exit 1; }
+    [ -f "$WAD" ] || { echo "no WAD at $WAD (set GITDOOM_WAD)" >&2; exit 1; }
+    # Optional first arg WxH pins an exact fixed size; otherwise the engine
+    # autoscales to the terminal and follows live resizes.
+    pinned=0
+    if [[ "${1:-}" =~ ^[0-9]+x[0-9]+$ ]]; then
+      GITDOOM_COLS="${1%x*}"; GITDOOM_ROWS="${1#*x}"; shift; pinned=1
+    fi
+    [ -n "${GITDOOM_COLS:-}${GITDOOM_ROWS:-}" ] && pinned=1
+    export GITDOOM_CHARSET="${GITDOOM_CHARSET:-color}"
+    commit=${GITDOOM_COMMIT:-1}
+    [ "$commit" = 1 ] && \
+      echo "note: truecolor recording throttles play to git's speed (no frames dropped). GITDOOM_COMMIT=0 to skip recording." >&2
+    if [ "$pinned" = 1 ]; then
+      tcols=$(tput cols 2>/dev/null || echo 999); tlines=$(tput lines 2>/dev/null || echo 999)
+      echo "rendering ${GITDOOM_COLS}x${GITDOOM_ROWS} ${GITDOOM_CHARSET} (fixed)" >&2
+      if [ "${GITDOOM_COLS}" -gt "$tcols" ] || [ "${GITDOOM_ROWS}" -gt "$((tlines - 1))" ]; then
+        echo "warning: bigger than your ${tcols}x${tlines} terminal — it'll be clipped. Drop the size to autoscale." >&2
+      fi
+      exec env GITDOOM_RENDER=1 GITDOOM_COMMIT="$commit" GITDOOM_COLS="${GITDOOM_COLS}" GITDOOM_ROWS="${GITDOOM_ROWS}" \
+        "$BIN" -iwad "$WAD" "$@"
+    else
+      echo "autoscaling to the terminal — resize freely · ${GITDOOM_CHARSET}" >&2
+      exec env GITDOOM_RENDER=1 GITDOOM_COMMIT="$commit" GITDOOM_AUTOSCALE=1 \
+        "$BIN" -iwad "$WAD" "$@"
+    fi
+    ;;
+
+  watch)
+    git -C "$REPO" rev-parse "refs/heads/$BRANCH" >/dev/null 2>&1 || echo "waiting for branch '$BRANCH'…" >&2
+    printf '\033[?1049h\033[2J\033[?25l'
+    trap 'printf "\033[?25h\033[?1049l"' EXIT
+    last=""
+    while :; do
+      sha=$(git -C "$REPO" rev-parse "refs/heads/$BRANCH" 2>/dev/null || true)
+      if [ -n "$sha" ] && [ "$sha" != "$last" ]; then
+        printf '\033[H'; show "$sha"; last="$sha"
+      fi
+      sleep 0.03
+    done
+    ;;
+
+  replay)
+    fps="${1:-15}"
+    delay=$(awk "BEGIN{printf \"%.4f\", 1/$fps}")
+    printf '\033[?1049h\033[2J\033[?25l'
+    trap 'printf "\033[?25h\033[?1049l"' EXIT
+    for sha in $(git -C "$REPO" rev-list --reverse "refs/heads/$BRANCH"); do
+      printf '\033[H'; show "$sha"; sleep "$delay"
+    done
+    ;;
+
+  saves)
+    git -C "$REPO" for-each-ref --format='%(refname:short)	%(subject)' 'refs/tags/save/*' \
+      || echo "no saves yet"
+    ;;
+
+  thumb)
+    name="${1:?usage: git-doom thumb <name>}"
+    git -C "$REPO" cat-file blob "save/$name^{tree}:thumb.txt"
+    ;;
+
+  clean)
+    rm -rf "$REPO" "$ROOT/.savegame"
+    echo "removed data repo and scratch savegame dir"
+    ;;
+
+  gc)
+    git -C "$REPO" gc --prune=now
+    ;;
+
+  ""|-h|--help|help) usage ;;
+  *) echo "unknown command: $cmd" >&2; usage; exit 1 ;;
+esac
