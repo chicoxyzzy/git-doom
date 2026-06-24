@@ -78,21 +78,29 @@ modifier.
 a name, Enter. Each slot is kept as a `save/slotN` git tag and restored next session
 — `git push` a save tag and someone else can load into the same state.
 
-## Performance — why it can feel slow
+## Performance
 
-git-doom commits **every frame** (`commit-tree` + `update-ref`), and truecolor
-frames are large (tens of KB). When git can't keep up, the default is to **never
-drop a frame**: the game throttles to git's commit speed — a lower but *complete*
-framerate — and flushes the backlog on exit. That's why play can feel slow,
-especially at large grid sizes. Trade completeness for speed:
+git-doom commits **every frame**, and truecolor frames are big — often a few hundred
+KB (≈240 KB at 160×50, ≈480 KB at 240×75). To keep that fast, frames stream into one
+persistent **`git fast-import`** process by default, instead of forking
+`git commit-tree` twice per frame — roughly **2–3× faster** (up to ~7× if you only
+flush at exit), enough to stay above DOOM's 35 Hz even at large grids. It's still one
+commit per frame; a checkpoint every `GITDOOM_CHECKPOINT` frames (default 12) flushes
+objects and advances the branch so `watch`/`replay` see progress.
+
+If git still can't keep up, the default is to **never drop a frame**: the game
+throttles to the commit rate (a lower but *complete* framerate) and flushes on exit.
+Knobs:
 
 ```sh
-GITDOOM_BLOCK=0  ./git-doom play   # drop frames when git lags → smooth play, lossy recording
-GITDOOM_COMMIT=0 ./git-doom play   # don't record at all → full speed
+GITDOOM_FASTIMPORT=0 ./git-doom play   # per-frame commit-tree (the older, slower path)
+GITDOOM_CHECKPOINT=4 ./git-doom play   # advance the branch more often → snappier live watch
+GITDOOM_BLOCK=0      ./git-doom play   # drop frames when git lags → smooth play, lossy recording
+GITDOOM_COMMIT=0     ./git-doom play   # don't record at all → full speed
 ```
 
-Smaller grids and `GITDOOM_CHARSET=half` commit faster; `./git-doom gc` packs the
-data repo between sessions.
+Smaller grids and `GITDOOM_CHARSET=half` commit faster. `./git-doom gc` packs the data
+repo between sessions — useful since fast-import leaves loose objects between checkpoints.
 
 ## Portability
 
@@ -115,9 +123,10 @@ input, and the save system — is at
 
 `DG_DrawFrame` downsamples the 640×400 framebuffer to the grid and emits a truecolor
 block per cell (color escapes delta-encoded; each row positioned absolutely so it
-never wraps), then appends it on a background thread with `commit-tree` +
-`update-ref` against a fixed empty tree — no working tree, no index. The subject is a
-HUD line (`frame N | hp H | Ts`); the body is the frame. The consumer is just git and
+never wraps). On a background thread it becomes a commit against a fixed empty tree —
+no working tree, no index — streamed by default into one persistent `git fast-import`
+(no fork per frame; `GITDOOM_FASTIMPORT=0` uses `commit-tree` instead). The subject is
+a HUD line (`frame N | hp H | Ts`); the body is the frame. The consumer is just git and
 a terminal: `watch` reprints the branch tip, `replay` walks `git rev-list --reverse`.
 Saving calls `G_DoSaveGame` directly and stores the real `.dsg` (plus a thumbnail) as
 a `save/slotN` tag.
@@ -141,6 +150,8 @@ a `save/slotN` tag.
 | `GITDOOM_BRANCH` | branch the frames commit to (default `main`) |
 | `GITDOOM_COLS` / `GITDOOM_ROWS` | pin grid size; unset = autoscale to the terminal |
 | `GITDOOM_CHARSET` | `color` (default, solid `█` blocks) or `half` (`▀`, 2× vertical detail) |
+| `GITDOOM_FASTIMPORT` | `1` (default) streams via `git fast-import`; `0` = per-frame `commit-tree` |
+| `GITDOOM_CHECKPOINT` | fast-import: frames between branch updates (default 12; lower = snappier `watch`) |
 | `GITDOOM_COMMIT=0` | don't record (full speed) |
 | `GITDOOM_BLOCK=0` | drop frames instead of throttling |
 

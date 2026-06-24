@@ -59,6 +59,7 @@ static char branch[256]     = "main";
 static int  opt_render      = 1;   // draw frames to the terminal
 static int  opt_commit      = 1;   // append frames as commits
 static long opt_max_frames  = 0;   // >0: exit after N frames (for testing)
+static long opt_bench       = 0;   // >0: micro-benchmark — commit N synthetic frames flat-out, print fps, exit
 
 // ---- timing -----------------------------------------------------------------
 static uint64_t start_ms;
@@ -188,6 +189,8 @@ static int   stop_commit = 0;
 static long  frame_no = 0;
 static long  dropped = 0;
 static int   opt_block = 1;   // 1: wait for git (never drop); 0: drop oldest when full
+static int   opt_fastimport = 1;   // default: stream frames through one `git fast-import` (batches the writes; far faster than a commit-tree fork per frame). GITDOOM_FASTIMPORT=0 = per-frame commit-tree.
+static long  opt_checkpoint = 12;  // fast-import: frames between checkpoints (flush + advance the ref so watch/replay see progress); 0 = only at exit
 static char  empty_tree[64] = "";
 static char  parent[64] = "";       // sha of previous frame; "" = orphan root
 static pthread_t th_input, th_commit;
@@ -270,8 +273,52 @@ static void commit_one(const char *msg) {
     (void)rc;
 }
 
+// ---- alternative commit path: one persistent `git fast-import` --------------
+// Instead of forking git twice per frame, stream every frame as a commit into a
+// single long-lived fast-import process. Each frame is still its own commit on
+// `branch`, but fast-import batches the writes into a packfile, so throughput is
+// far higher. A `checkpoint` every opt_checkpoint frames flushes the packfile and
+// advances the ref so watch/replay see progress (the batch dial); 0 = flush only
+// at exit (fastest, no live view). Written only from the commit thread.
+static FILE *fi = NULL;
+static long  fi_since_ckpt = 0;
+
+static void fastimport_start(void) {
+    char cmd[1300];
+    // Fresh orphan branch: drop the old ref so the first streamed commit is a root.
+    snprintf(cmd, sizeof cmd, "git -C '%s' update-ref -d refs/heads/%s 2>/dev/null", repo_path, branch);
+    int rc = system(cmd); (void)rc;
+    snprintf(cmd, sizeof cmd,
+             "git -C '%s' fast-import --force --quiet --date-format=now >/dev/null 2>&1",
+             repo_path);
+    fi = popen(cmd, "w");
+    if (!fi) opt_fastimport = 0;   // couldn't start it: fall back to commit_one
+}
+
+static void fastimport_one(const char *msg) {
+    size_t len = strlen(msg);
+    fprintf(fi, "commit refs/heads/%s\n", branch);     // no `from`: chains on the branch tip
+    fputs("committer git-doom <doom@git.local> now\n", fi);
+    fprintf(fi, "data %zu\n", len);
+    fwrite(msg, 1, len, fi);
+    fputs("\ndeleteall\n\n", fi);                       // empty tree: the frame lives in the message
+    if (opt_checkpoint > 0 && ++fi_since_ckpt >= opt_checkpoint) {
+        fputs("checkpoint\n", fi);                      // flush packfile + advance the ref for watchers
+        fflush(fi);
+        fi_since_ckpt = 0;
+    }
+}
+
+static void fastimport_finish(void) {
+    if (!fi) return;
+    fputs("checkpoint\n", fi);
+    pclose(fi);                  // EOF -> fast-import writes the packfile, advances the ref, exits
+    fi = NULL;
+}
+
 static void *commit_thread(void *arg) {
     (void)arg;
+    if (opt_fastimport) fastimport_start();
     for (;;) {
         pthread_mutex_lock(&cq_m);
         while (cq_head == cq_tail && !stop_commit) pthread_cond_wait(&cq_cv, &cq_m);
@@ -280,9 +327,10 @@ static void *commit_thread(void *arg) {
         cq_head = (cq_head + 1) % CQ;
         pthread_cond_signal(&cq_space);   // a slot opened up
         pthread_mutex_unlock(&cq_m);
-        commit_one(m);
+        if (opt_fastimport && fi) fastimport_one(m); else commit_one(m);
         free(m);
     }
+    if (opt_fastimport) fastimport_finish();
     return NULL;
 }
 
@@ -348,8 +396,15 @@ static void git_sync_slot(int slot) {
     memcpy(body + mn, thumb, thumb_len);
     write_repo_file(".doom-savemsg", body, mn + thumb_len);
     free(body);
-    if (parent[0])
-        snprintf(cmd, sizeof cmd, "git -C '%s' commit-tree %s -p %s -F .doom-savemsg 2>/dev/null", repo_path, treesha, parent);
+    char sp[64] = "";   // parent for the save commit
+    if (opt_fastimport) {   // commit_one isn't tracking `parent`; use the branch tip (last checkpoint)
+        snprintf(cmd, sizeof cmd, "git -C '%s' rev-parse -q --verify refs/heads/%s 2>/dev/null", repo_path, branch);
+        popen_line(cmd, sp, sizeof sp);
+    } else {
+        strncpy(sp, parent, sizeof sp - 1);
+    }
+    if (sp[0])
+        snprintf(cmd, sizeof cmd, "git -C '%s' commit-tree %s -p %s -F .doom-savemsg 2>/dev/null", repo_path, treesha, sp);
     else
         snprintf(cmd, sizeof cmd, "git -C '%s' commit-tree %s -F .doom-savemsg 2>/dev/null", repo_path, treesha);
     if (!popen_line(cmd, commitsha, sizeof commitsha) || strlen(commitsha) < 7) return;
@@ -431,6 +486,9 @@ static void parse_env(void) {
     g_autoscale = !pinned;   // no explicit size -> track the terminal live
     if ((v = getenv("GITDOOM_AUTOSCALE"))) { g_autoscale = atoi(v); }
     if ((v = getenv("GITDOOM_BLOCK")))     { opt_block = atoi(v); }
+    if ((v = getenv("GITDOOM_FASTIMPORT"))) { opt_fastimport = atoi(v); }
+    if ((v = getenv("GITDOOM_CHECKPOINT"))) { opt_checkpoint = atol(v); }
+    if ((v = getenv("GITDOOM_BENCH")))      { opt_bench = atol(v); }
     if ((v = getenv("GITDOOM_CHARSET"))) {
         g_half = (!strcmp(v, "half") || !strcmp(v, "halfblock"));   // else solid "color"
     }
@@ -645,9 +703,40 @@ int DG_GetKey(int *pressed, unsigned char *key) {
 
 void DG_SetWindowTitle(const char *title) { (void)title; }
 
+// ---- micro-benchmark --------------------------------------------------------
+// Commit opt_bench frames as fast as the pipeline allows, decoupled from DOOM's
+// 35 Hz loop, and report commits/sec. Compare GITDOOM_FASTIMPORT=0 vs 1 (and
+// GITDOOM_CHECKPOINT). Run headless: GITDOOM_RENDER=0 GITDOOM_BENCH=N.
+static void run_bench(void) {
+    int saved = opt_commit; opt_commit = 0;          // render a real frame without committing it
+    for (int i = 0; i < 10 && DG_ScreenBuffer; i++) doomgeneric_Tick();
+    opt_commit = saved;
+    static char bf[FRAME_CHARS + 1];
+    int blen = render_color(bf, g_cols, g_rows);
+
+    uint64_t t0 = now_ms();
+    for (long i = 0; i < opt_bench; i++) { frame_no++; enqueue_commit(bf, blen); }
+    pthread_mutex_lock(&cq_m);                        // drain + (fast-import) finalize the packfile
+    stop_commit = 1;
+    pthread_cond_signal(&cq_cv);
+    pthread_cond_broadcast(&cq_space);
+    pthread_mutex_unlock(&cq_m);
+    pthread_join(th_commit, NULL);
+    double secs = (now_ms() - t0) / 1000.0;
+    if (secs <= 0) secs = 0.001;
+
+    fprintf(stderr,
+            "BENCH %-11s grid=%dx%d bytes/frame=%d checkpoint=%ld: %ld frames in %.2fs = %.0f commits/s\n",
+            opt_fastimport ? "fast-import" : "commit-tree",
+            g_cols, g_rows, blen, opt_fastimport ? opt_checkpoint : -1,
+            opt_bench, secs, opt_bench / secs);
+    restore_term();
+}
+
 int main(int argc, char **argv) {
     doomgeneric_Create(argc, argv);
     restore_saves_from_git();   // savegamedir is set now; populate the load menu
+    if (opt_bench > 0) { run_bench(); return 0; }
     for (;;) doomgeneric_Tick();
     return 0;
 }

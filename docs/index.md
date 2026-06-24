@@ -82,7 +82,7 @@ no files.**
 git is content-addressed — blobs, trees, and commits keyed by hash, with branches as
 movable name tags. Normally a commit snapshots a tree of files. We don't want files; we
 want a message. So every frame commits against the same **empty tree**, on a background
-thread:
+thread. The plumbing version is two commands:
 
 ```
 git commit-tree <empty-tree> -p <parent> -F <frame>   # write a commit object
@@ -99,15 +99,28 @@ Every session starts a fresh orphan `main` — last run's recording is gone — 
 all those commits share one empty tree, the repo grows only by commit objects. No
 blobs. A whole playthrough is cheap.
 
-### Keeping up with the game (or not)
+Forking `git` twice per frame like that is the simple version — and too slow at large
+grids. So the default doesn't: it streams these same commits through one long-lived
+`git fast-import` instead. That's the next section.
 
-Confession: committing is slower than rendering. `commit-tree` forks a process, and a
-truecolor frame is tens of kilobytes. Frames reach the commit thread through a bounded
-queue, and the default is stubborn — **never drop a frame.** When the queue fills, the
-game thread blocks. So when git can't keep up, *the game slows down* to git's pace: a
-lower framerate, but a complete recording, flushed to the last frame on exit.
+### Keeping up with the game
 
-Don't want that? Two switches:
+Committing is slower than rendering. A truecolor frame is big — a few hundred KB of
+escape codes (≈240 KB at 160×50) — and forking `git commit-tree` plus `update-ref`
+*twice per frame* can't keep up at large grids.
+
+So the default doesn't fork per frame: it streams every frame as a commit into one
+long-lived **`git fast-import`** process. Same one-commit-per-frame chain, but the
+object writes batch into a packfile and there's no per-frame process spawn — roughly
+2–7× faster, enough to hold above DOOM's 35 Hz. fast-import only publishes the branch
+on a `checkpoint`, so git-doom checkpoints every dozen frames (`GITDOOM_CHECKPOINT`):
+the dial between live-`watch` latency and raw throughput. `GITDOOM_FASTIMPORT=0` drops
+back to the plain `commit-tree` path above.
+
+Either way, frames reach the commit thread through a bounded queue, and the default is
+stubborn — **never drop a frame.** When the queue fills the game thread blocks, so if
+git still can't keep up the *game* slows to a lower but complete framerate, flushed to
+the last frame on exit. Two switches change that:
 
 - `GITDOOM_BLOCK=0` — drop the oldest queued frame instead of waiting. Smooth to play,
   lossy to watch.
@@ -184,14 +197,15 @@ back into the savegame folder
 saves listed in the Load menu. And because a save is just a tag, `git push` it — someone
 else fetches, loads, and is standing exactly where you were, health and all.
 
-## Why git, and why it's slow
+## Why git, and what it costs
 
 git is a content-addressed store of immutable objects with friendly names bolted on
 top. That is also — if you squint — a framebuffer and a save system, which is the whole
-joke, and it holds up. The bill comes due in throughput: every frame is an object write
-plus a ref update, truecolor frames are big, so recording drags play down to git's
-speed. Completeness over framerate, with `GITDOOM_BLOCK` and `GITDOOM_COMMIT` to trade
-one for the other.
+joke, and it holds up. The bill comes due in throughput: every frame is an object write,
+and truecolor frames are big. Streaming them through `git fast-import` keeps that cheap
+enough to stay above DOOM's 35 Hz — but at the limit, recording still throttles play.
+Completeness over framerate, with `GITDOOM_BLOCK` and `GITDOOM_COMMIT` to trade one for
+the other.
 
 ## Map of the code
 
@@ -199,7 +213,8 @@ One platform file, `doomgeneric/doomgeneric_git.c`:
 
 - `DG_DrawFrame` — downsample, render to blocks, queue the commit, drive save/load.
 - `render_color` — the block and half-block rendering.
-- `commit_one` and the commit thread — `commit-tree` + `update-ref`.
+- the commit thread — streams frames into `git fast-import` (`fastimport_*`), or
+  `commit_one` (`commit-tree` + `update-ref`) when `GITDOOM_FASTIMPORT=0`.
 - `git_sync_slot` / `restore_saves_from_git` — the save-tag machinery.
 - `input_thread` / `DG_GetKey` — terminal input and the synthetic key-up.
 - `fit_to_terminal` and the `SIGWINCH` handler — autoscaling.
